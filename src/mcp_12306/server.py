@@ -41,8 +41,8 @@ USER_AGENT = (
 # 中国铁路 12306 API 常量 - URL
 HTTP_URLS = {
     "init": "https://kyfw.12306.cn/otn/leftTicket/init",
-    "query_left_ticket": "https://kyfw.12306.cn/otn/leftTicket/queryG",
-    "query_transfer": "https://kyfw.12306.cn/lcquery/queryG",
+    "query_left_ticket": "https://kyfw.12306.cn/otn/leftTicket/queryI",
+    "query_transfer": "https://kyfw.12306.cn/lcquery/queryI",
     "query_price": "https://kyfw.12306.cn/otn/leftTicketPrice/queryAllPublicPrice",
     "query_route_stations": "https://kyfw.12306.cn/otn/czxx/queryByTrainNo",
 }
@@ -58,6 +58,41 @@ HTTP_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Origin": "https://kyfw.12306.cn"
 }
+
+# 12306 会不定期把 queryG 302 到 queryI / queryZ 等实际接口。
+# 这里统一允许重定向，并在日志中记录最终落点，避免把正常跳转误判为错误。
+HTTP_TIMEOUT = 8
+HTTP_FOLLOW_REDIRECTS = True
+
+def create_12306_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        follow_redirects=HTTP_FOLLOW_REDIRECTS,
+        timeout=HTTP_TIMEOUT,
+        verify=False
+    )
+
+def get_redirect_info(resp: httpx.Response) -> Dict[str, Any]:
+    return {
+        "final_url": str(resp.url),
+        "redirect_chain": [
+            {
+                "status_code": r.status_code,
+                "location": r.headers.get("location", ""),
+                "url": str(r.url)
+            }
+            for r in resp.history
+        ],
+    }
+
+def is_12306_error_response(resp: httpx.Response) -> bool:
+    final_url = str(resp.url)
+    return (
+        resp.status_code != 200
+        or "error.html" in final_url
+        or "/ntce/" in final_url
+        or "resources/error" in final_url
+    )
+
 
 # Connected clients for session management
 connected_clients: Dict[str, Dict] = {}
@@ -684,7 +719,7 @@ async def query_tickets_validated(args: dict) -> list:
 
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
+                async with create_12306_client() as client:
                     await client.get(url_init, headers=headers)
                     params = {
                         "leftTicketDTO.train_date": train_date,
@@ -693,10 +728,16 @@ async def query_tickets_validated(args: dict) -> list:
                         "purpose_codes": "ADULT"
                     }
                     resp = await client.get(url_u, headers=headers, params=params)
-                    logger.info(f"12306 queryG status: {resp.status_code}, url: {resp.url}")
-                    if resp.status_code != 200:
-                        logger.error(f"12306接口返回异常: {resp.status_code}, body: {resp.text}")
-                        response_data = {"success": False, "error": "12306接口返回异常", "status_code": resp.status_code, "detail": resp.text[:200]}
+                    logger.info(f"12306 leftTicket status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
+                    if is_12306_error_response(resp):
+                        logger.error(f"12306接口返回异常: {resp.status_code}, final_url: {resp.url}, body: {resp.text}")
+                        response_data = {
+                            "success": False,
+                            "error": "12306接口返回异常或反爬虫拦截",
+                            "status_code": resp.status_code,
+                            "final_url": str(resp.url),
+                            "detail": resp.text[:200]
+                        }
                         return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
                     try:
                         data = resp.json().get("data", {})
@@ -796,7 +837,7 @@ async def get_train_no_by_train_code_validated(args: dict) -> list:
     """
     根据车次号、出发站、到达站、日期，查询唯一列车编号train_no。
     只允许精确匹配，所有参数必须为全名或三字码。
-    直接请求 /otn/leftTicket/queryG。
+    以 /otn/leftTicket/queryG 作为初始入口请求；若 12306 返回 302 到 queryI/queryZ 等实际接口，允许跟随跳转并使用最终响应。
     """
     train_code = args.get("train_code", "").strip().upper()
     from_station = args.get("from_station", "").strip().upper()
@@ -827,7 +868,7 @@ async def get_train_no_by_train_code_validated(args: dict) -> list:
     url_u = HTTP_URLS["query_left_ticket"]
     headers = HTTP_HEADERS.copy()
     
-    async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
+    async with create_12306_client() as client:
         await client.get(url_init, headers=headers)
         params = {
             "leftTicketDTO.train_date": train_date,
@@ -1002,13 +1043,13 @@ async def get_train_route_stations_validated(args: dict) -> list:
 
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
+                async with create_12306_client() as client:
                     # 先访问init获取cookie
                     init_resp = await client.get("https://kyfw.12306.cn/otn/leftTicket/init", headers=headers)
                     logger.info(f"12306 init status: {init_resp.status_code}")
                     
                     resp = await client.get(url, headers=headers, params=params)
-                    logger.info(f"12306 route query status: {resp.status_code}, url: {resp.url}")
+                    logger.info(f"12306 route query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
                     
                     # 检查HTTP状态码
                     if resp.status_code != 200:
@@ -1150,7 +1191,7 @@ async def query_transfer_validated(args: dict) -> list:
 
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
+                async with create_12306_client() as client:
                     # 先访问init获取cookie
                     await client.get(url_init, headers=headers)
                     
@@ -1174,10 +1215,18 @@ async def query_transfer_validated(args: dict) -> list:
                         
                         resp = await client.get(url, headers=headers, params=params)
                         
-                        # 检查反爬虫
-                        if resp.status_code == 302 or "error.html" in str(resp.headers.get("location", "")):
+                        logger.info(f"12306 transfer query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
+
+                        # 允许 queryG 正常 302 到 queryI/queryZ 等最终接口；只把错误页/非200视为异常
+                        if is_12306_error_response(resp):
                             if page_num == 1:
-                                response_data = {"success": False, "error": "12306反爬虫拦截（302跳转），请稍后重试或更换网络环境"}
+                                response_data = {
+                                    "success": False,
+                                    "error": "12306接口返回异常或反爬虫拦截",
+                                    "status_code": resp.status_code,
+                                    "final_url": str(resp.url),
+                                    "detail": resp.text[:200]
+                                }
                                 return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
                             else:
                                 break
@@ -1373,14 +1422,20 @@ async def query_ticket_price_validated(args: dict) -> list:
 
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
+                async with create_12306_client() as client:
                     await client.get(url_init, headers=headers)
                     resp = await client.get(url_price, headers=headers, params=params)
-                    logger.info(f"12306 price query status: {resp.status_code}, url: {resp.url}")
+                    logger.info(f"12306 price query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
                     
-                    if resp.status_code != 200:
-                         logger.error(f"12306接口返回异常: {resp.status_code}")
-                         response_data = {"success": False, "error": f"12306接口返回异常: {resp.status_code}"}
+                    if is_12306_error_response(resp):
+                         logger.error(f"12306接口返回异常: {resp.status_code}, final_url: {resp.url}")
+                         response_data = {
+                             "success": False,
+                             "error": "12306接口返回异常或反爬虫拦截",
+                             "status_code": resp.status_code,
+                             "final_url": str(resp.url),
+                             "detail": resp.text[:200]
+                         }
                          return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
                     
                     try:

@@ -1,4 +1,4 @@
-"""配置管理"""
+"""配置管理 — 基于 pydantic-settings 的 .env 配置加载"""
 
 import logging
 from typing import Optional

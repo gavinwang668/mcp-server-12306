@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-12306"
-version = "0.3.1.post20260628"
+version = "0.4.0.post20260703"
 description = "MCP服务器用于12306车票查询"
 authors = [
     {name = "Drfccv", email = "2713587802@qq.com"}
@@ -12,30 +12,18 @@ authors = [
 dynamic = ["readme"]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "fastapi>=0.104.0",
-    "uvicorn>=0.24.0",
     "httpx>=0.25.0",
-    "pydantic>=2.4.0",
     "pydantic-settings>=2.0.0",
-    "python-multipart>=0.0.6",
     "mcp>=1.9.0",
-    "python-dotenv>=1.0.0",
     "aiofiles>=23.2.1",
-    "beautifulsoup4>=4.12.0",
-    "requests>=2.31.0",
-    "aiohttp>=3.9.0",
     "pytz>=2025.2",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-httpx>=0.26.0",
-    "black>=23.9.0",
-    "isort>=5.12.0",
-    "mypy>=1.6.0",
-    "pre-commit>=3.5.0",
+http = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "python-multipart>=0.0.6",
 ]
 
 [dependency-groups]
@@ -63,8 +51,8 @@ name = "aliyun"
 url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [project.scripts]
-mcp-server-12306 = "mcp_12306.cli:main"
-mcp-12306 = "mcp_12306.server:main"
+mcp-server-12306 = "mcp_12306.stdio_server:main"
+mcp-12306 = "mcp_12306.http_server:main"
 
 [tool.black]
 line-length = 88

@@ -1,14 +1,14 @@
 # 🚄 MCP Server 12306
 
-![screenshot](https://img.shields.io/badge/12306-MCP-blue?logo=railway) 
-![FastAPI](https://img.shields.io/badge/FastAPI-async-green?logo=fastapi) 
+![screenshot](https://img.shields.io/badge/12306-MCP-blue?logo=railway)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ---
 
 ## ✨ 项目简介
 
-MCP Server 12306是一款基于 Model Context Protocol (MCP) 的高性能火车票查询后端，支持官方 12306 余票、票价、车站、经停、换乘查询以及智能时间工具，适配 AI/自动化/智能助手等场景。界面友好，易于集成，开箱即用。
+MCP Server 12306 是一款基于 Model Context Protocol (MCP) 的高性能火车票查询服务，支持官方 12306 余票、票价、车站、经停、换乘查询以及智能时间工具，适配 AI/自动化/智能助手等场景，开箱即用。
 
 
 ---
@@ -16,13 +16,12 @@ MCP Server 12306是一款基于 Model Context Protocol (MCP) 的高性能火车�
 ## 🚀 功能亮点
 
 - 实时余票/车次/座席/时刻/换乘一站式查询
-- 全国车站信息管理与模糊搜索
-- 官方经停站、一次中转方案全支持
+- 全国车站信息管理与模糊搜索，支持中文、拼音、简拼、三字码
+- 官方经停站、中转换乘方案全支持
 - 实时查询各车次票价信息
 - 智能时间工具，支持时区和时间戳
-- Streamable HTTP/STDIO传输协议，支持MCP 2025-03-26标准
-- FastAPI异步高性能，秒级响应
-- MCP标准，AI/自动化场景即插即用
+- 双传输模式：Stdio（Claude Desktop 推荐）| Streamable HTTP（远程部署）
+- MCP 2025-03-26 标准，AI/自动化场景即插即用
 
 ---
 
@@ -30,7 +29,7 @@ MCP Server 12306是一款基于 Model Context Protocol (MCP) 的高性能火车�
 
 本项目支持两种运行模式：
 1. **Stdio 模式**：适用于 Claude Desktop 等本地 MCP 客户端（推荐）。
-2. **Streamable HTTP 模式**：适用于远程部署或通过 SSE/Post 访问。
+2. **Streamable HTTP 模式**：适用于远程部署或通过 SSE/POST 访问。
 
 ---
 
@@ -72,31 +71,45 @@ MCP Server 12306是一款基于 Model Context Protocol (MCP) 的高性能火车�
 
 适用于开发者调试：
 
+```bash
+cd mcp-server-12306
+uv sync
+```
+
 ```json
 {
   "mcpServers": {
     "12306": {
       "command": "uv",
-      "args": ["run", "python", "-m", "mcp_12306.cli"],
-      "cwd": "/path/to/mcp-server-12306"
+      "args": ["--directory", "/path/to/mcp-server-12306", "run", "mcp-server-12306"]
     }
   }
 }
 ```
 
+
 ---
 
 ### 模式 2：Streamable HTTP 模式
 
-在此模式下，Server 启动一个 Web 服务（默认 8000 端口），支持 MCP 的 SSE（Server-Sent Events）和 POST 交互。
+在此模式下，Server 启动一个 Web 服务（默认 8000 端口），支持 MCP 的 SSE 和 POST 交互。
 
-#### 方式 A：本地源码运行
+#### 方式 A：pip 安装后运行
+
+```bash
+# 安装 HTTP 模式（含 FastAPI / uvicorn）
+pip install mcp-server-12306[http]
+# 启动
+mcp-12306
+```
+
+#### 方式 B：本地源码运行
 
 ```bash
 # 1. 克隆并安装依赖
 git clone https://github.com/drfccv/mcp-server-12306.git
 cd mcp-server-12306
-uv sync
+uv sync --extra http
 
 # 2. 启动服务器
 uv run python scripts/start_server.py
@@ -114,7 +127,7 @@ uv run python scripts/start_server.py
 }
 ```
 
-#### 方式 B：Docker 部署
+#### 方式 C：Docker 部署
 
 ```bash
 # 拉取镜像并运行
@@ -126,15 +139,15 @@ docker run -d -p 8000:8000 --name mcp-server-12306 drfccv/mcp-server-12306:lates
 ## 🤖 工具一览
 
 ### 支持的主流程工具
-| 工具名                    | 典型场景/功能描述                 |
-|--------------------------|----------------------------------|
-| query_tickets            | 余票/车次/座席/时刻一站式查询     |
-| query_ticket_price     | 实时查询各车次票价信息             |
-| search_stations          | 车站模糊搜索，支持中文/拼音/简拼   |
-| get_station_info         | 获取车站详情（名称、代码、地理等） |
-| query_transfer           | 一次中转换乘方案，自动拼接最优中转 |
-| get_train_route_stations | 查询指定列车经停站及时刻表         |
-| get_current_time         | 获取当前时间与相对日期，帮助用户准确选择出行日期 |
+| 工具名                       | 功能描述                          |
+|-----------------------------|-----------------------------------|
+| `query-tickets`             | 余票/车次/座席/时刻一站式查询      |
+| `query-ticket-price`        | 实时查询各车次票价信息              |
+| `search-stations`           | 车站模糊搜索，支持中文/拼音/简拼    |
+| `query-transfer`            | 中转换乘方案，自动拼接最优路径      |
+| `get-train-route-stations`  | 查询指定列车经停站及时刻表          |
+| `get-train-no-by-train-code`| 车次号转官方唯一编号               |
+| `get-current-time`          | 当前时间与相对日期，辅助日期选择    |
 
 ---
 
@@ -145,7 +158,7 @@ docker run -d -p 8000:8000 --name mcp-server-12306 drfccv/mcp-server-12306:lates
 - [query_tickets.md](./docs/query_tickets.md) — 余票/车次/座席/时刻一站式查询
 - [query_ticket_price.md](./docs/query_ticket_price.md) — 实时查询各车次票价信息
 - [search_stations.md](./docs/search_stations.md) — 车站智能搜索
-- [query_transfer.md](./docs/query_transfer.md) — 一次中转换乘方案
+- [query_transfer.md](./docs/query_transfer.md) — 中转换乘方案
 - [get_train_route_stations.md](./docs/get_train_route_stations.md) — 查询列车经停站
 - [get_current_time.md](./docs/get_current_time.md) — 获取当前时间与相对日期
 
@@ -162,11 +175,19 @@ docker run -d -p 8000:8000 --name mcp-server-12306 drfccv/mcp-server-12306:lates
 ## 🧩 目录结构
 
 ```
-src/mcp_12306/    # 主源代码
-  ├─ server.py    # FastAPI主入口
-  ├─ services/    # 业务逻辑（车票/车站/HTTP）
-  ├─ utils/       # 工具与配置
-scripts/          # 启动与数据脚本
+src/mcp_12306/          # 主源代码
+  ├─ http_server.py     # FastAPI HTTP 传输层
+  ├─ stdio_server.py    # Stdio 传输层 + CLI 入口
+  ├─ services/          # 业务逻辑
+  │   ├─ station_service.py  # 车站数据服务
+  │   └─ ticket_service.py   # 票务查询核心（stdio/HTTP 共享）
+  ├─ utils/             # 配置与日期工具
+  │   ├─ config.py
+  │   └─ date_utils.py
+  └─ resources/         # 静态资源（车站数据）
+scripts/                # 启动与数据更新脚本
+  ├─ start_server.py    # HTTP 模式一键启动
+  └─ update_stations.py # 更新车站数据
 ```
 
 ---

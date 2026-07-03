@@ -1,4 +1,4 @@
-"""启动服务器脚本"""
+"""12306 MCP 服务器启动脚本 — Streamable HTTP 模式一键启动"""
 
 import asyncio
 import sys
@@ -38,13 +38,13 @@ def check_environment():
         # 检查必要的包
         import mcp
         import fastapi
+        import uvicorn
         import httpx
-        import pydantic
         logger.info("✅ 所有必要包已安装")
         return True
     except ImportError as e:
         logger.error(f"❌ 缺少必要包: {e}")
-        logger.error("请运行: uv sync")
+        logger.error("请运行: uv sync --extra http")
         return False
 
 
@@ -56,7 +56,7 @@ def main():
             sys.exit(1)
             
         # 导入并运行服务器
-        from mcp_12306.server import main_server
+        from mcp_12306.http_server import main_server
         
         logger.info("🚀 启动12306 MCP服务器...")
         

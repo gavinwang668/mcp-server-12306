@@ -1,5 +1,5 @@
-"""12306 MCP服务器包"""
+"""MCP Server 12306 — 12306 火车票查询 MCP 服务"""
 
-__version__ = "0.3.1.post20260425"
+__version__ = "0.4.0.post20260703"
 __author__ = "Drfccv"
 __email__ = "2713587802@qq.com"

@@ -1,5 +1,7 @@
+"""12306 车站数据更新脚本 — 从官网拉取最新 station_name.js 并解析"""
+
 import asyncio
-import aiohttp
+import httpx
 import aiofiles
 import os
 import sys
@@ -14,13 +16,13 @@ STATION_JS_URL = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.
 LOCAL_PATH = "src/mcp_12306/resources/station_name.js"
 
 async def fetch_station_js(url=STATION_JS_URL, save_path=LOCAL_PATH):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise Exception(f"请求失败，状态码: {resp.status}")
-            text = await resp.text(encoding='utf-8', errors='ignore')
-            async with aiofiles.open(save_path, "w", encoding="utf-8") as f:
-                await f.write(text)
+    async with httpx.AsyncClient(verify=False) as client:
+        resp = await client.get(url)
+        if resp.status_code != 200:
+            raise Exception(f"请求失败，状态码: {resp.status_code}")
+        text = resp.text
+        async with aiofiles.open(save_path, "w", encoding="utf-8") as f:
+            await f.write(text)
     return save_path
 
 async def update_stations():

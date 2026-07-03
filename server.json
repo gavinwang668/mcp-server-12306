@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.drfccv/mcp-server-12306",
+  "description": "An MCP server that provides 12306 ticket query",
+  "repository": {
+    "url": "https://github.com/drfccv/mcp-server-12306",
+    "source": "github"
+  },
+  "version": "0.4.0.post20260703",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-server-12306",
+      "version": "0.4.0.post20260703",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

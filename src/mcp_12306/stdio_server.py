@@ -1,4 +1,8 @@
-"""MCP Server 12306 - Stdio Transport Implementation"""
+"""MCP Server 12306 — Stdio 传输实现
+
+通过标准输入/输出（stdio）与 MCP 客户端通信，不使用任何 HTTP 框架。
+适用于 Claude Desktop 等本地 MCP 客户端。
+"""
 
 import asyncio
 import logging
@@ -7,9 +11,7 @@ from mcp.server import Server
 from mcp.types import Tool, TextContent
 
 from .services.station_service import StationService
-
-# 导入现有的工具处理函数
-from .server import (
+from .services.ticket_service import (
     search_stations_validated,
     query_tickets_validated,
     query_ticket_price_validated,
@@ -17,8 +19,8 @@ from .server import (
     get_train_route_stations_validated,
     query_transfer_validated,
     get_current_time_validated,
-    station_service as global_station_service,
-    SERVER_NAME
+    station_service,
+    SERVER_NAME,
 )
 
 logging.basicConfig(
@@ -191,8 +193,8 @@ async def run_stdio_server():
     logger.info("正在加载车站数据...")
     
     # 加载车站数据
-    await global_station_service.load_stations()
-    logger.info(f"已加载 {len(global_station_service.stations)} 个车站")
+    await station_service.load_stations()
+    logger.info(f"已加载 {len(station_service.stations)} 个车站")
     
     # 运行服务器
     from mcp.server.stdio import stdio_server
@@ -204,3 +206,41 @@ async def run_stdio_server():
             write_stream,
             server.create_initialization_options()
         )
+
+
+def main():
+    """Stdio 模式 CLI 入口 — 参数解析 + 启动服务器"""
+    import sys
+    import argparse
+    from mcp_12306 import __version__
+
+    parser = argparse.ArgumentParser(
+        description="MCP Server for 12306 Ticket Query (Stdio Mode)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 启动 MCP 服务器（通过 stdin 等待 JSON-RPC 消息）
+  mcp-server-12306
+
+  # 查看版本
+  mcp-server-12306 --version
+"""
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}"
+    )
+    parser.parse_args()
+
+    try:
+        asyncio.run(run_stdio_server())
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在关闭服务器...")
+    except Exception as e:
+        logger.error(f"服务器运行失败: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

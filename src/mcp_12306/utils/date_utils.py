@@ -1,4 +1,4 @@
-"""日期工具"""
+"""日期工具 — 格式校验与 12306 预售期范围检查"""
 
 from datetime import datetime, date, timedelta
 import re

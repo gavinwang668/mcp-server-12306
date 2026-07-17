@@ -41,7 +41,7 @@ USER_AGENT = (
 HTTP_URLS = {
     "init": "https://kyfw.12306.cn/otn/leftTicket/init",
     "query_left_ticket": "https://kyfw.12306.cn/otn/leftTicket/queryI",
-    "query_transfer": "https://kyfw.12306.cn/lcquery/queryI",
+    "query_transfer": "https://kyfw.12306.cn/lcquery/queryG",
     "query_price": "https://kyfw.12306.cn/otn/leftTicketPrice/queryAllPublicPrice",
     "query_route_stations": "https://kyfw.12306.cn/otn/czxx/queryByTrainNo",
 }

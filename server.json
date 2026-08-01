@@ -6,12 +6,12 @@
     "url": "https://github.com/drfccv/mcp-server-12306",
     "source": "github"
   },
-  "version": "0.4.0.post20260717",
+  "version": "0.4.0.post20260801",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "mcp-server-12306",
-      "version": "0.4.0.post20260717",
+      "version": "0.4.0.post20260801",
       "transport": {
         "type": "stdio"
       }

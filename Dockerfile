@@ -1,13 +1,13 @@
-FROM python:3.10-alpine AS builder
+FROM python:3.12-alpine AS builder
 WORKDIR /app
 RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --extra http --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
-RUN uv sync --extra http --frozen --no-dev && \
+RUN uv sync --frozen --no-dev && \
     find /app/.venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
 
-FROM python:3.10-alpine
+FROM python:3.12-alpine
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src

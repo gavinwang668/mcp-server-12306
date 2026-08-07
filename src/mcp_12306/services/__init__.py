@@ -3,7 +3,6 @@
 from .station_service import StationService
 from .ticket_service import (
     MCP_TOOLS,
-    MCP_PROTOCOL_VERSION,
     SERVER_NAME,
     SERVER_VERSION,
     station_service,
@@ -19,7 +18,6 @@ from .ticket_service import (
 __all__ = [
     "StationService",
     "MCP_TOOLS",
-    "MCP_PROTOCOL_VERSION",
     "SERVER_NAME",
     "SERVER_VERSION",
     "station_service",

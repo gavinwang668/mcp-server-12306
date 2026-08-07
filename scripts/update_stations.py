@@ -1,21 +1,21 @@
 """12306 车站数据更新脚本 — 从官网拉取最新 station_name.js 并解析"""
 
 import asyncio
-import httpx
+import httpx2 as httpx
 import aiofiles
 import os
 import sys
 from datetime import datetime, timezone
 
-# 兼容包路径，自动把项目根目录加入PYTHONPATH
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# 兼容包路径，自动把 src 目录加入PYTHONPATH
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from src.mcp_12306.services.station_service import StationService
+from mcp_12306.services.station_service import StationService
 
 STATION_JS_URL = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js"
 LOCAL_PATH = "src/mcp_12306/resources/station_name.js"
 
-async def fetch_station_js(url=STATION_JS_URL, save_path=LOCAL_PATH):
+async def fetch_station_js(url: str = STATION_JS_URL, save_path: str = LOCAL_PATH) -> str:
     async with httpx.AsyncClient(verify=False) as client:
         resp = await client.get(url)
         if resp.status_code != 200:
@@ -25,7 +25,7 @@ async def fetch_station_js(url=STATION_JS_URL, save_path=LOCAL_PATH):
             await f.write(text)
     return save_path
 
-async def update_stations():
+async def update_stations() -> None:
     print("🚀 12306车站信息更新工具")
     print("=" * 50)
     print(f"🌐 数据源: {STATION_JS_URL}")

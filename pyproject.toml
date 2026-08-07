@@ -4,36 +4,50 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-12306"
-version = "0.4.0.post20260801"
+version = "0.5.0.post20260807"
 description = "MCP服务器用于12306车票查询"
 authors = [
     {name = "Drfccv", email = "2713587802@qq.com"}
 ]
+license = "MIT"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dynamic = ["readme"]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "httpx>=0.25.0",
-    "pydantic-settings>=2.0.0",
-    "mcp>=1.9.0",
-    "aiofiles>=23.2.1",
-    "pytz>=2025.2",
+    "httpx2>=2.5.0",
+    "pydantic-settings>=2.15.0",
+    "mcp>=2.0.0,<3",
+    "aiofiles>=25.1.0",
+    "pytz>=2026.3",
 ]
 
 [project.optional-dependencies]
-http = [
-    "fastapi>=0.104.0",
-    "uvicorn>=0.24.0",
-    "python-multipart>=0.0.6",
-]
+# Streamable HTTP 传输依赖（starlette / uvicorn / python-multipart）均由 mcp 传递提供，无需显式声明
 
 [dependency-groups]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
-    "pytest-httpx>=0.26.0",
     "black>=23.9.0",
     "isort>=5.12.0",
     "mypy>=1.6.0",
+    "types-aiofiles>=24.1.0",
+    "types-pytz>=2024.1.0",
     "pre-commit>=3.5.0",
     "build>=1.5.0",
     "twine>=6.2.0",

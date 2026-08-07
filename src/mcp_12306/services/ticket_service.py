@@ -1,15 +1,17 @@
 """共享业务逻辑层 — stdio 与 Streamable HTTP 两种传输模式共用
 
-不依赖任何 HTTP 框架，仅使用 httpx + pydantic-settings + pytz + aiofiles。
+不依赖任何 HTTP 框架，仅使用 httpx2 + pydantic-settings + pytz + aiofiles。
 """
 
 import asyncio
 import json
 import logging
 import re
-import httpx
-from datetime import datetime, date
-from typing import Dict, List, Any
+from collections.abc import Awaitable, Callable
+from datetime import datetime
+from typing import Any, TypeVar
+
+import httpx2 as httpx
 import pytz
 
 from .station_service import StationService
@@ -26,8 +28,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 station_service = StationService()
 
-# MCP Protocol Version
-MCP_PROTOCOL_VERSION = "2025-03-26"
 SERVER_NAME = "mcp-server-12306"
 SERVER_VERSION = __version__
 
@@ -70,7 +70,7 @@ def create_12306_client() -> httpx.AsyncClient:
     )
 
 
-def get_redirect_info(resp: httpx.Response) -> Dict[str, Any]:
+def get_redirect_info(resp: httpx.Response) -> dict[str, Any]:
     return {
         "final_url": str(resp.url),
         "redirect_chain": [
@@ -252,61 +252,187 @@ MCP_TOOLS = [
 ]
 
 
+# ========== 通用响应构造 ==========
+
+def _ok(**data: Any) -> list[dict]:
+    """构造成功响应（MCP 文本内容约定）。"""
+    return [{"type": "text", "text": json.dumps({"success": True, **data}, ensure_ascii=False)}]
+
+
+def _err(error: str, **extra: Any) -> list[dict]:
+    """构造失败响应。"""
+    return [{"type": "text", "text": json.dumps({"success": False, "error": error, **extra}, ensure_ascii=False)}]
+
+
+def _unexpected_error(context: str, exc: Exception) -> list[dict]:
+    """记录未预期异常日志并构造统一失败响应。"""
+    detail = f"{type(exc).__name__}: {exc}"
+    logger.error(f"{context}失败: {detail}", exc_info=True)
+    return _err(f"{context}失败", detail=detail)
+
+
+# ========== 12306 请求辅助 ==========
+
+class ApiError(Exception):
+    """12306 业务请求错误 —— 直接返回给客户端，不参与网络重试。"""
+
+    def __init__(self, message: str, **extra: Any):
+        super().__init__(message)
+        self.message = message
+        self.extra = extra
+
+
+class RetryExhaustedError(RuntimeError):
+    """网络请求重试次数耗尽。"""
+
+
+_NETWORK_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)
+
+T = TypeVar("T")
+
+
+async def _request_with_retry(
+    operation: str,
+    handler: Callable[[httpx.AsyncClient], Awaitable[T]],
+    *,
+    retries: int = 3,
+) -> T:
+    """带重试地执行 12306 请求。
+
+    每次尝试都会新建客户端并先访问 init 端点（维持会话 cookie）。
+    仅对网络类异常重试；业务错误由 handler 抛出 ``ApiError`` 直达调用方。
+    """
+    last_exception: Exception | None = None
+    for attempt in range(retries):
+        try:
+            async with create_12306_client() as client:
+                await client.get(HTTP_URLS["init"], headers=HTTP_HEADERS.copy())
+                return await handler(client)
+        except _NETWORK_ERRORS as e:
+            last_exception = e
+            if attempt < retries - 1:
+                logger.warning(f"{operation}网络请求失败，正在重试 ({attempt + 1}/{retries}): {e}")
+                await asyncio.sleep(1)
+            else:
+                logger.error(f"{operation}网络请求重试次数已耗尽: {e}")
+    raise RetryExhaustedError(f"网络请求失败 (已重试{retries}次): {last_exception}") from last_exception
+
+
+# ========== 字段提取辅助 ==========
+
+def _extract_seats(record: dict, mapping: dict[str, str], *, exclude: str | None = None) -> dict[str, str]:
+    """从 12306 记录中提取非空座位字段，可选排除占位值（如 '--'）。"""
+    return {
+        name: val
+        for field, name in mapping.items()
+        if (val := record.get(field)) and val != exclude
+    }
+
+
+def _format_price(raw: str) -> str:
+    """将 12306 原始价格（单位：分）格式化为元。"""
+    if raw.isdigit():
+        price_str = str(int(raw))
+        return f"0.{price_str}" if len(price_str) == 1 else f"{price_str[:-1]}.{price_str[-1]}"
+    return raw
+
+
+# 余票查询座位字段 → 输出键名映射
+_SEAT_FIELD_MAP = {
+    "business_seat_num": "business",
+    "first_class_num": "first_class",
+    "second_class_num": "second_class",
+    "advanced_soft_sleeper_num": "advanced_soft_sleeper",
+    "soft_sleeper_num": "soft_sleeper",
+    "hard_sleeper_num": "hard_sleeper",
+    "soft_seat_num": "soft_seat",
+    "hard_seat_num": "hard_seat",
+    "no_seat_num": "no_seat",
+    "dongwo_num": "dongwo",
+}
+
+# 中转方案座位字段 → 输出键名映射
+_TRANSFER_SEAT_MAP = {
+    "swz_num": "商务座",
+    "tz_num": "特等座",
+    "zy_num": "一等座",
+    "ze_num": "二等座",
+    "gr_num": "高级软卧",
+    "rw_num": "软卧",
+    "rz_num": "一等卧",
+    "yw_num": "硬卧",
+    "yz_num": "硬座",
+    "wz_num": "无座",
+}
+
+# 票价字段 → 输出键名映射
+_PRICE_FIELD_MAP = {
+    "wz_price": "无座",
+    "yz_price": "硬座",
+    "yw_price": "硬卧",
+    "rw_price": "软卧",
+    "gr_price": "高级软卧",
+    "ze_price": "二等座",
+    "zy_price": "一等座",
+    "swz_price": "商务座",
+    "tdz_price": "特等座",
+    "dw_price": "动卧",
+}
+
+
 # ========== 车站模糊搜索工具 ==========
 
 async def search_stations_validated(args: dict) -> list:
+    """智能车站搜索：支持中文名、拼音、简拼、三字码。"""
     query = args.get("query", "").strip()
     limit = args.get("limit", 10)
+
     if not query:
-        return [{"type": "text", "text": json.dumps({"success": False, "error": "请输入搜索关键词"}, ensure_ascii=False)}]
+        return _err("请输入搜索关键词")
     if not isinstance(limit, int) or limit < 1 or limit > 50:
         limit = 10
-    result = await station_service.search_stations(query, limit)
-    if result.stations:
-        stations_data = []
-        for station in result.stations:
-            station_dict = {
-                "name": station.name,
-                "code": station.code,
-                "pinyin": station.pinyin,
-                "py_short": station.py_short if station.py_short else "",
-            }
-            if hasattr(station, 'num') and station.num:
-                station_dict["num"] = station.num
-            stations_data.append(station_dict)
 
-        response_data = {
-            "success": True,
-            "query": query,
-            "count": len(stations_data),
-            "stations": stations_data
-        }
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-    else:
-        response_data = {
-            "success": False,
-            "query": query,
-            "count": 0,
-            "stations": [],
-            "message": "未找到匹配的车站",
-            "suggestions": [
+    result = await station_service.search_stations(query, limit)
+    if not result.stations:
+        return _err(
+            "未找到匹配的车站",
+            query=query,
+            count=0,
+            stations=[],
+            suggestions=[
                 "尝试完整城市名称 (如: 北京)",
                 "尝试拼音 (如: beijing)",
                 "尝试简拼 (如: bj)",
-                "检查拼写是否正确"
-            ]
+                "检查拼写是否正确",
+            ],
+        )
+
+    stations_data = []
+    for station in result.stations:
+        station_dict = {
+            "name": station.name,
+            "code": station.code,
+            "pinyin": station.pinyin,
+            "py_short": station.py_short if station.py_short else "",
         }
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        if hasattr(station, "num") and station.num:
+            station_dict["num"] = station.num
+        stations_data.append(station_dict)
+
+    return _ok(query=query, count=len(stations_data), stations=stations_data)
 
 
 # ========== 车票查询工具 ==========
 
 async def query_tickets_validated(args: dict) -> list:
+    """官方12306余票/车次/座席/时刻一站式查询。"""
     try:
         from_station = args.get("from_station", "").strip()
         to_station = args.get("to_station", "").strip()
         train_date = args.get("train_date", "").strip()
         logger.info(f"查询参数: {from_station} -> {to_station} ({train_date})")
+
+        # 参数聚合校验：一次性报告所有缺失/非法项
         errors = []
         if not from_station:
             errors.append("出发站不能为空")
@@ -320,151 +446,127 @@ async def query_tickets_validated(args: dict) -> list:
             is_valid, error_msg = validate_date_not_past(train_date)
             if not is_valid:
                 errors.append(error_msg)
-
         if errors:
-            response_data = {"success": False, "errors": errors}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return [{"type": "text", "text": json.dumps({"success": False, "errors": errors}, ensure_ascii=False)}]
+
+        # 站名 → 三字码（无法识别时附带模糊搜索建议）
         from_code = await ensure_telecode(from_station)
         to_code = await ensure_telecode(to_station)
         if not from_code or not to_code:
             suggestions = []
-            if not from_code:
-                result = await station_service.search_stations(from_station, 3)
+            for label, station, code in (("from", from_station, from_code), ("to", to_station, to_code)):
+                if code:
+                    continue
+                result = await station_service.search_stations(station, 3)
                 if result.stations:
-                    suggestions.append({"station_type": "from", "input": from_station, "matches": [{"name": s.name, "code": s.code, "pinyin": s.pinyin, "py_short": s.py_short} for s in result.stations]})
-            if not to_code:
-                result = await station_service.search_stations(to_station, 3)
-                if result.stations:
-                    suggestions.append({"station_type": "to", "input": to_station, "matches": [{"name": s.name, "code": s.code, "pinyin": s.pinyin, "py_short": s.py_short} for s in result.stations]})
-            response_data = {"success": False, "error": "车站名称无效", "suggestions": suggestions, "hint": "可尝试拼音、简拼、三字码或用 search_stations 工具辅助查询"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+                    suggestions.append({
+                        "station_type": label,
+                        "input": station,
+                        "matches": [
+                            {"name": s.name, "code": s.code, "pinyin": s.pinyin, "py_short": s.py_short}
+                            for s in result.stations
+                        ],
+                    })
+            return _err(
+                "车站名称无效",
+                suggestions=suggestions,
+                hint="可尝试拼音、简拼、三字码或用 search_stations 工具辅助查询",
+            )
 
-        url_init = HTTP_URLS["init"]
-        url_u = HTTP_URLS["query_left_ticket"]
-        headers = HTTP_HEADERS.copy()
-        max_retries = 3
-        last_exception = None
-        tickets_data = []
-
-        for attempt in range(max_retries):
+        async def _fetch_tickets(client: httpx.AsyncClient) -> Any:
+            params = {
+                "leftTicketDTO.train_date": train_date,
+                "leftTicketDTO.from_station": from_code,
+                "leftTicketDTO.to_station": to_code,
+                "purpose_codes": "ADULT",
+            }
+            resp = await client.get(HTTP_URLS["query_left_ticket"], headers=HTTP_HEADERS.copy(), params=params)
+            logger.info(f"12306 leftTicket status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
+            if is_12306_error_response(resp):
+                logger.error(f"12306接口返回异常: {resp.status_code}, final_url: {resp.url}, body: {resp.text}")
+                raise ApiError(
+                    "12306接口返回异常或反爬虫拦截",
+                    status_code=resp.status_code,
+                    final_url=str(resp.url),
+                    detail=resp.text[:200],
+                )
             try:
-                async with create_12306_client() as client:
-                    await client.get(url_init, headers=headers)
-                    params = {
-                        "leftTicketDTO.train_date": train_date,
-                        "leftTicketDTO.from_station": from_code,
-                        "leftTicketDTO.to_station": to_code,
-                        "purpose_codes": "ADULT"
-                    }
-                    resp = await client.get(url_u, headers=headers, params=params)
-                    logger.info(f"12306 leftTicket status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
-                    if is_12306_error_response(resp):
-                        logger.error(f"12306接口返回异常: {resp.status_code}, final_url: {resp.url}, body: {resp.text}")
-                        response_data = {
-                            "success": False,
-                            "error": "12306接口返回异常或反爬虫拦截",
-                            "status_code": resp.status_code,
-                            "final_url": str(resp.url),
-                            "detail": resp.text[:200]
-                        }
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                    try:
-                        data = resp.json().get("data", {})
-                        tickets_data = data.get("result", [])
-                        break
-                    except Exception as e:
-                        logger.error(f"12306响应解析失败: {repr(e)}，原始内容: {resp.text}")
-                        response_data = {"success": False, "error": "12306响应解析失败", "detail": f"{type(e).__name__}: {str(e)}"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(f"查询车票网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"查询车票网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-        tickets = []
-        for ticket_str in tickets_data:
-            ticket = parse_ticket_string(ticket_str, {
-                "from_station": from_station,
-                "to_station": to_station,
-                "train_date": train_date
+                return resp.json().get("data", {}).get("result", [])
+            except ValueError as e:
+                logger.error(f"12306响应解析失败: {e!r}，原始内容: {resp.text}")
+                raise ApiError("12306响应解析失败", detail=f"{type(e).__name__}: {e}") from e
+
+        try:
+            tickets_data = await _request_with_retry("查询车票", _fetch_tickets)
+        except RetryExhaustedError as e:
+            return _err(str(e))
+        except ApiError as e:
+            return _err(e.message, **e.extra)
+
+        # 解析车票数据
+        tickets = [
+            t
+            for t in (
+                parse_ticket_string(s, {
+                    "from_station": from_station,
+                    "to_station": to_station,
+                    "train_date": train_date,
+                })
+                for s in tickets_data
+            )
+            if t
+        ]
+        if not tickets:
+            return _err(
+                "未找到该线路的余票",
+                from_station=from_station,
+                to_station=to_station,
+                train_date=train_date,
+                count=0,
+                trains=[],
+            )
+
+        trains_list = []
+        for ticket, ticket_str in zip(tickets, tickets_data):
+            from_station_name = to_station_name = from_code_actual = to_code_actual = None
+            if ticket_str:
+                parts = ticket_str.split("|")
+                from_code_actual = parts[6] if len(parts) > 6 else None
+                to_code_actual = parts[7] if len(parts) > 7 else None
+                from_station_obj = await station_service.get_station_by_code(from_code_actual) if from_code_actual else None
+                to_station_obj = await station_service.get_station_by_code(to_code_actual) if to_code_actual else None
+                from_station_name = from_station_obj.name if from_station_obj else (from_code_actual or "未知")
+                to_station_name = to_station_obj.name if to_station_obj else (to_code_actual or "未知")
+
+            trains_list.append({
+                "train_no": ticket["train_no"],
+                "from_station": from_station_name,
+                "from_station_code": from_code_actual,
+                "to_station": to_station_name,
+                "to_station_code": to_code_actual,
+                "start_time": ticket["start_time"],
+                "arrive_time": ticket["arrive_time"],
+                "duration": ticket["duration"],
+                "seats": _extract_seats(ticket, _SEAT_FIELD_MAP),
             })
-            if ticket:
-                tickets.append(ticket)
-        if tickets:
-            trains_list = []
-            for i, ticket in enumerate(tickets, 1):
-                ticket_str = tickets_data[i-1] if i-1 < len(tickets_data) else None
-                from_station_name = to_station_name = from_code_actual = to_code_actual = None
-                if ticket_str:
-                    parts = ticket_str.split('|')
-                    from_code_actual = parts[6] if len(parts) > 6 else None
-                    to_code_actual = parts[7] if len(parts) > 7 else None
-                    from_station_obj = await station_service.get_station_by_code(from_code_actual) if from_code_actual else None
-                    to_station_obj = await station_service.get_station_by_code(to_code_actual) if to_code_actual else None
-                    from_station_name = from_station_obj.name if from_station_obj else (from_code_actual or "未知")
-                    to_station_name = to_station_obj.name if to_station_obj else (to_code_actual or "未知")
 
-                seats = {}
-                if ticket['business_seat_num']: seats["business"] = ticket['business_seat_num']
-                if ticket['first_class_num']: seats["first_class"] = ticket['first_class_num']
-                if ticket['second_class_num']: seats["second_class"] = ticket['second_class_num']
-                if ticket['advanced_soft_sleeper_num']: seats["advanced_soft_sleeper"] = ticket['advanced_soft_sleeper_num']
-                if ticket['soft_sleeper_num']: seats["soft_sleeper"] = ticket['soft_sleeper_num']
-                if ticket['hard_sleeper_num']: seats["hard_sleeper"] = ticket['hard_sleeper_num']
-                if ticket['soft_seat_num']: seats["soft_seat"] = ticket['soft_seat_num']
-                if ticket['hard_seat_num']: seats["hard_seat"] = ticket['hard_seat_num']
-                if ticket['no_seat_num']: seats["no_seat"] = ticket['no_seat_num']
-                if ticket['dongwo_num']: seats["dongwo"] = ticket['dongwo_num']
-
-                train_data = {
-                    "train_no": ticket['train_no'],
-                    "from_station": from_station_name,
-                    "from_station_code": from_code_actual,
-                    "to_station": to_station_name,
-                    "to_station_code": to_code_actual,
-                    "start_time": ticket['start_time'],
-                    "arrive_time": ticket['arrive_time'],
-                    "duration": ticket['duration'],
-                    "seats": seats
-                }
-                trains_list.append(train_data)
-
-            response_data = {
-                "success": True,
-                "from_station": from_station,
-                "to_station": to_station,
-                "train_date": train_date,
-                "count": len(trains_list),
-                "trains": trains_list
-            }
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-        else:
-            response_data = {
-                "success": False,
-                "from_station": from_station,
-                "to_station": to_station,
-                "train_date": train_date,
-                "count": 0,
-                "trains": [],
-                "message": "未找到该线路的余票"
-            }
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _ok(
+            from_station=from_station,
+            to_station=to_station,
+            train_date=train_date,
+            count=len(trains_list),
+            trains=trains_list,
+        )
     except Exception as e:
-        import traceback
-        error_detail = f"{type(e).__name__}: {str(e)}"
-        logger.error(f"查询车票失败: {error_detail}\n{traceback.format_exc()}")
-        response_data = {"success": False, "error": "查询失败", "detail": error_detail}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        detail = f"{type(e).__name__}: {e}"
+        logger.error(f"查询车票失败: {detail}", exc_info=True)
+        return _err("查询失败", detail=detail)
 
 
 # ========== 车次号转编号工具 ==========
 
 async def get_train_no_by_train_code_validated(args: dict) -> list:
+    """车次号转官方唯一编号（train_no），支持三字码/全名。"""
     train_code = args.get("train_code", "").strip().upper()
     from_station = args.get("from_station", "").strip().upper()
     to_station = args.get("to_station", "").strip().upper()
@@ -472,95 +574,87 @@ async def get_train_no_by_train_code_validated(args: dict) -> list:
 
     is_valid, error_msg = validate_date_not_past(train_date)
     if not is_valid:
-        response_data = {"success": False, "error": error_msg}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _err(error_msg)
 
     from_code = await ensure_telecode(from_station)
     if not from_code:
-        response_data = {"success": False, "error": f"出发站无效或无法识别：{from_station}"}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _err(f"出发站无效或无法识别：{from_station}")
     from_station = from_code
 
     to_code = await ensure_telecode(to_station)
     if not to_code:
-        response_data = {"success": False, "error": f"到达站无效或无法识别：{to_station}"}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _err(f"到达站无效或无法识别：{to_station}")
     to_station = to_code
 
-    url_init = HTTP_URLS["init"]
-    url_u = HTTP_URLS["query_left_ticket"]
-    headers = HTTP_HEADERS.copy()
-
-    async with create_12306_client() as client:
-        await client.get(url_init, headers=headers)
+    async def _fetch_tickets(client: httpx.AsyncClient) -> Any:
         params = {
             "leftTicketDTO.train_date": train_date,
             "leftTicketDTO.from_station": from_station,
             "leftTicketDTO.to_station": to_station,
-            "purpose_codes": "ADULT"
+            "purpose_codes": "ADULT",
         }
-        resp = await client.get(url_u, headers=headers, params=params)
+        resp = await client.get(HTTP_URLS["query_left_ticket"], headers=HTTP_HEADERS.copy(), params=params)
         try:
-            data = resp.json().get("data", {})
-            tickets_data = data.get("result", [])
-        except Exception:
-            response_data = {"success": False, "error": "12306反爬拦截或数据异常，请稍后重试"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return resp.json().get("data", {}).get("result", [])
+        except ValueError as e:
+            logger.error(f"12306响应解析失败: {e}")
+            raise ApiError("12306反爬拦截或数据异常，请稍后重试") from e
+
+    try:
+        tickets_data = await _request_with_retry("车次号转换", _fetch_tickets)
+    except RetryExhaustedError as e:
+        return _err(str(e))
+    except ApiError as e:
+        return _err(e.message, **e.extra)
 
     if not tickets_data:
-        response_data = {"success": False, "error": f"未找到该线路的余票数据（{from_station}->{to_station} {train_date}）"}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _err(f"未找到该线路的余票数据（{from_station}->{to_station} {train_date}）")
 
-    def extract_train_info(ticket_str):
+    def extract_train_info(ticket_str: str) -> dict | None:
         try:
-            parts = ticket_str.split('|')
-            idx = parts.index('预订')
+            parts = ticket_str.split("|")
+            idx = parts.index("预订")
             return {
-                "train_no": parts[idx+1].strip(),
-                "train_code": parts[idx+2].strip().upper()
+                "train_no": parts[idx + 1].strip(),
+                "train_code": parts[idx + 2].strip().upper(),
             }
-        except Exception:
+        except ValueError:
             return None
 
     found = None
+    debug_codes: list[str] = []
     for ticket_str in tickets_data:
         info = extract_train_info(ticket_str)
-        if info and info["train_code"] == train_code:
+        if not info:
+            continue
+        debug_codes.append(info["train_code"])
+        if info["train_code"] == train_code:
             found = info["train_no"]
             break
 
     if not found:
-        debug_codes = []
-        for ticket_str in tickets_data:
-            info = extract_train_info(ticket_str)
-            if info:
-                debug_codes.append(info["train_code"])
+        return _err(
+            "未找到该车次号的列车编号",
+            train_code=train_code,
+            from_station=from_station,
+            to_station=to_station,
+            train_date=train_date,
+            available_trains=debug_codes,
+        )
 
-        response_data = {
-            "success": False,
-            "train_code": train_code,
-            "from_station": from_station,
-            "to_station": to_station,
-            "train_date": train_date,
-            "error": "未找到该车次号的列车编号",
-            "available_trains": debug_codes
-        }
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
-    response_data = {
-        "success": True,
-        "train_code": train_code,
-        "train_no": found,
-        "from_station": from_station,
-        "to_station": to_station,
-        "train_date": train_date
-    }
-    return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+    return _ok(
+        train_code=train_code,
+        train_no=found,
+        from_station=from_station,
+        to_station=to_station,
+        train_date=train_date,
+    )
 
 
 # ========== 经停站查询工具 ==========
 
 async def get_train_route_stations_validated(args: dict) -> list:
+    """列车经停站全表查询，支持车次号或官方编号。"""
     try:
         train_no = args.get("train_no", "").strip()
         from_station = args.get("from_station", "").strip().upper()
@@ -568,128 +662,86 @@ async def get_train_route_stations_validated(args: dict) -> list:
         train_date = args.get("train_date", "").strip()
 
         if not train_no:
-            response_data = {"success": False, "error": "车次编号(train_no)不能为空"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("车次编号(train_no)不能为空")
         if not from_station:
-            response_data = {"success": False, "error": "出发站不能为空"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("出发站不能为空")
         if not to_station:
-            response_data = {"success": False, "error": "到达站不能为空"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("到达站不能为空")
         if not train_date:
-            response_data = {"success": False, "error": "出发日期不能为空"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("出发日期不能为空")
 
         is_valid, error_msg = validate_date_not_past(train_date)
         if not is_valid:
-            response_data = {"success": False, "error": error_msg}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(error_msg)
 
-        def is_telecode(val):
-            return val.isalpha() and val.isupper() and len(val) == 3
+        from_code = await ensure_telecode(from_station)
+        if not from_code:
+            return _err(f"出发站无效或无法识别：{from_station}")
+        from_station = from_code
 
-        if not is_telecode(from_station):
-            code = await station_service.get_station_code(from_station)
-            if not code:
-                response_data = {"success": False, "error": f"出发站无效或无法识别：{from_station}"}
-                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            from_station = code
+        to_code = await ensure_telecode(to_station)
+        if not to_code:
+            return _err(f"到达站无效或无法识别：{to_station}")
+        to_station = to_code
 
-        if not is_telecode(to_station):
-            code = await station_service.get_station_code(to_station)
-            if not code:
-                response_data = {"success": False, "error": f"到达站无效或无法识别：{to_station}"}
-                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            to_station = code
-
-        is_train_code = bool(re.match(r'^[A-Z]+\d+$', train_no))
-
+        # 车次号 → 官方列车编号（内部复用转换工具）
+        is_train_code = bool(re.match(r"^[A-Z]+\d+$", train_no))
         if is_train_code:
             logger.info(f"检测到车次号 {train_no}，正在转换为列车编号...")
-            convert_args = {
+            convert_result = await get_train_no_by_train_code_validated({
                 "train_code": train_no,
                 "from_station": from_station,
                 "to_station": to_station,
-                "train_date": train_date
-            }
-            convert_result = await get_train_no_by_train_code_validated(convert_args)
-
+                "train_date": train_date,
+            })
             if not convert_result or not convert_result[0].get("text"):
-                response_data = {"success": False, "error": f"无法获取车次 {train_no} 的列车编号"}
-                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
-            result_json_str = convert_result[0].get("text", "{}")
-            result_data = json.loads(result_json_str)
+                return _err(f"无法获取车次 {train_no} 的列车编号")
+            result_data = json.loads(convert_result[0].get("text", "{}"))
             if not result_data.get("success"):
                 return convert_result
-
             actual_train_no = result_data.get("train_no")
             if not actual_train_no:
-                response_data = {"success": False, "error": f"无法解析车次 {train_no} 的列车编号"}
-                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+                return _err(f"无法解析车次 {train_no} 的列车编号")
             logger.info(f"车次 {train_no} 转换为列车编号: {actual_train_no}")
         else:
             actual_train_no = train_no
             logger.info(f"使用列车编号: {actual_train_no}")
 
-        url = HTTP_URLS["query_route_stations"]
         params = {
             "train_no": actual_train_no,
             "from_station_telecode": from_station,
             "to_station_telecode": to_station,
-            "depart_date": train_date
+            "depart_date": train_date,
         }
 
-        headers = HTTP_HEADERS.copy()
-
-        max_retries = 3
-        last_exception = None
-        json_data = None
-
-        for attempt in range(max_retries):
+        async def _fetch_route(client: httpx.AsyncClient) -> Any:
+            resp = await client.get(HTTP_URLS["query_route_stations"], headers=HTTP_HEADERS.copy(), params=params)
+            logger.info(f"12306 route query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
+            if resp.status_code != 200:
+                logger.error(f"12306接口返回异常状态码: {resp.status_code}, body: {resp.text}")
+                raise ApiError(f"12306接口返回异常: {resp.status_code}")
+            if "error.html" in str(resp.url) or "ntce" in str(resp.url):
+                raise ApiError("12306反爬虫拦截，请稍后重试或更换网络环境")
             try:
-                async with create_12306_client() as client:
-                    init_resp = await client.get("https://kyfw.12306.cn/otn/leftTicket/init", headers=headers)
-                    logger.info(f"12306 init status: {init_resp.status_code}")
+                data = resp.json()
+            except ValueError as e:
+                logger.error(f"12306响应解析失败: {e}, body: {resp.text}")
+                raise ApiError(f"12306响应解析失败: {e}") from e
+            logger.info(f"12306 response keys: {list(data.keys()) if data else 'None'}")
+            return data
 
-                    resp = await client.get(url, headers=headers, params=params)
-                    logger.info(f"12306 route query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
-
-                    if resp.status_code != 200:
-                        logger.error(f"12306接口返回异常状态码: {resp.status_code}, body: {resp.text}")
-                        response_data = {"success": False, "error": f"12306接口返回异常: {resp.status_code}"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
-                    if "error.html" in str(resp.url) or "ntce" in str(resp.url):
-                        response_data = {"success": False, "error": "12306反爬虫拦截，请稍后重试或更换网络环境"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
-                    try:
-                        json_data = resp.json()
-                        logger.info(f"12306 response keys: {list(json_data.keys()) if json_data else 'None'}")
-                        break
-                    except Exception as e:
-                        logger.error(f"12306响应解析失败: {str(e)}, body: {resp.text}")
-                        response_data = {"success": False, "error": f"12306响应解析失败: {str(e)}"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(f"查询经停站网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"查询经停站网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        try:
+            json_data = await _request_with_retry("查询经停站", _fetch_route)
+        except RetryExhaustedError as e:
+            return _err(str(e))
+        except ApiError as e:
+            return _err(e.message, **e.extra)
 
         if not json_data:
-            response_data = {"success": False, "error": "12306接口返回空数据"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("12306接口返回空数据")
 
         data = json_data.get("data", {})
         stations = data.get("data", [])
-
         if not stations and "middleList" in data:
             stations = []
             for m in data["middleList"]:
@@ -701,163 +753,127 @@ async def get_train_route_stations_validated(args: dict) -> list:
             stations = data["route"]
 
         if not stations:
-            response_data = {"success": False, "train_no": train_no, "error": "未找到经停站信息"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("未找到经停站信息", train_no=train_no)
 
-        stations_list = []
-        for station in stations:
-            station_data = {
+        stations_list = [
+            {
                 "station_no": station.get("station_no", station.get("from_station_no", "")),
                 "station_name": station.get("station_name", station.get("from_station_name", "")),
                 "arrive_time": station.get("arrive_time", "----"),
                 "start_time": station.get("start_time", "----"),
-                "stopover_time": station.get("stopover_time", "----")
+                "stopover_time": station.get("stopover_time", "----"),
             }
-            stations_list.append(station_data)
+            for station in stations
+        ]
 
-        response_data = {
-            "success": True,
-            "train_no": train_no,
-            "train_date": train_date,
-            "count": len(stations_list),
-            "stations": stations_list
-        }
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
+        return _ok(
+            train_no=train_no,
+            train_date=train_date,
+            count=len(stations_list),
+            stations=stations_list,
+        )
     except Exception as e:
-        logger.error(f"查询经停站失败: {repr(e)}")
-        response_data = {"success": False, "error": "查询经停站失败", "detail": str(e)}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _unexpected_error("查询经停站", e)
 
 
 # ========== 中转换乘查询工具 ==========
 
 async def query_transfer_validated(args: dict) -> list:
+    """官方中转换乘方案查询（自动分页抓取全部方案）。"""
     try:
         from_station = args.get("from_station", "").strip()
         to_station = args.get("to_station", "").strip()
         train_date = args.get("train_date", "").strip()
-        middle_station = args.get("middle_station", "").strip() if "middle_station" in args else ""
-        isShowWZ = args.get("isShowWZ", "N").strip().upper() or "N"
+        middle_station = args.get("middle_station", "").strip()
+        is_show_wz = args.get("isShowWZ", "N").strip().upper() or "N"
         purpose_codes = args.get("purpose_codes", "00").strip().upper() or "00"
 
         if not from_station or not to_station or not train_date:
-            response_data = {"success": False, "error": "请输入出发站、到达站和出发日期"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("请输入出发站、到达站和出发日期")
 
         is_valid, error_msg = validate_date_not_past(train_date)
         if not is_valid:
-            response_data = {"success": False, "error": error_msg}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(error_msg)
 
         from_code = await ensure_telecode(from_station)
-        to_code = await ensure_telecode(to_station)
         if not from_code:
-            response_data = {"success": False, "error": f"出发站无效或无法识别：{from_station}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(f"出发站无效或无法识别：{from_station}")
+        to_code = await ensure_telecode(to_station)
         if not to_code:
-            response_data = {"success": False, "error": f"到达站无效或无法识别：{to_station}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(f"到达站无效或无法识别：{to_station}")
 
-        middle_station_code = ""
+        middle_station_code: str | None = ""
         if middle_station:
             middle_station_code = await ensure_telecode(middle_station)
             if not middle_station_code:
                 logger.warning(f"无法识别中转站: {middle_station}")
                 middle_station_code = middle_station
 
-        url_init = HTTP_URLS["init"]
-        url = HTTP_URLS["query_transfer"]
-        headers = HTTP_HEADERS.copy()
+        async def _fetch_transfers(client: httpx.AsyncClient) -> Any:
+            """分页抓取全部中转方案。"""
+            all_transfer_list: list = []
+            page_size = 10
+            result_index = 0
+            page_num = 1
 
-        all_transfer_list = []
-        max_retries = 3
-        last_exception = None
+            while True:
+                params = {
+                    "train_date": train_date,
+                    "from_station_telecode": from_code,
+                    "to_station_telecode": to_code,
+                    "middle_station": middle_station_code,
+                    "result_index": str(result_index),
+                    "can_query": "Y",
+                    "isShowWZ": is_show_wz,
+                    "purpose_codes": purpose_codes,
+                    "channel": "E",
+                }
+                resp = await client.get(HTTP_URLS["query_transfer"], headers=HTTP_HEADERS.copy(), params=params)
+                logger.info(f"12306 transfer query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
 
-        for attempt in range(max_retries):
-            try:
-                async with create_12306_client() as client:
-                    await client.get(url_init, headers=headers)
-
-                    page_size = 10
-                    result_index = 0
-                    page_num = 1
-
-                    while True:
-                        params = {
-                            "train_date": train_date,
-                            "from_station_telecode": from_code,
-                            "to_station_telecode": to_code,
-                            "middle_station": middle_station_code,
-                            "result_index": str(result_index),
-                            "can_query": "Y",
-                            "isShowWZ": isShowWZ,
-                            "purpose_codes": purpose_codes,
-                            "channel": "E"
-                        }
-
-                        resp = await client.get(url, headers=headers, params=params)
-
-                        logger.info(f"12306 transfer query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
-
-                        if is_12306_error_response(resp):
-                            if page_num == 1:
-                                response_data = {
-                                    "success": False,
-                                    "error": "12306接口返回异常或反爬虫拦截",
-                                    "status_code": resp.status_code,
-                                    "final_url": str(resp.url),
-                                    "detail": resp.text[:200]
-                                }
-                                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                            else:
-                                break
-
-                        try:
-                            data = resp.json().get("data", {})
-                            transfer_list = data.get("middleList", [])
-                        except Exception:
-                            if page_num == 1:
-                                response_data = {"success": False, "error": "12306反爬拦截或数据异常，请稍后重试"}
-                                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                            else:
-                                break
-
-                        if not transfer_list:
-                            break
-
-                        all_transfer_list.extend(transfer_list)
-
-                        if len(transfer_list) < page_size:
-                            break
-
-                        result_index += page_size
-                        page_num += 1
-
+                if is_12306_error_response(resp):
+                    if page_num == 1:
+                        raise ApiError(
+                            "12306接口返回异常或反爬虫拦截",
+                            status_code=resp.status_code,
+                            final_url=str(resp.url),
+                            detail=resp.text[:200],
+                        )
                     break
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                all_transfer_list = []
-                if attempt < max_retries - 1:
-                    logger.warning(f"中转查询网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"中转查询网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+
+                try:
+                    transfer_list = resp.json().get("data", {}).get("middleList", [])
+                except ValueError:
+                    if page_num == 1:
+                        raise ApiError("12306反爬拦截或数据异常，请稍后重试")
+                    break
+
+                if not transfer_list:
+                    break
+                all_transfer_list.extend(transfer_list)
+                if len(transfer_list) < page_size:
+                    break
+                result_index += page_size
+                page_num += 1
+
+            return all_transfer_list
+
+        try:
+            all_transfer_list = await _request_with_retry("中转查询", _fetch_transfers)
+        except RetryExhaustedError as e:
+            return _err(str(e))
+        except ApiError as e:
+            return _err(e.message, **e.extra)
 
         if not all_transfer_list:
-            response_data = {
-                "success": False,
-                "from_station": from_station,
-                "to_station": to_station,
-                "train_date": train_date,
-                "count": 0,
-                "transfers": [],
-                "message": "未查到中转方案"
-            }
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(
+                "未查到中转方案",
+                from_station=from_station,
+                to_station=to_station,
+                train_date=train_date,
+                count=0,
+                transfers=[],
+            )
 
         transfers_list = []
         for item in all_transfer_list:
@@ -866,82 +882,44 @@ async def query_transfer_validated(args: dict) -> list:
                 if len(full_list) < 2:
                     continue
 
-                segments = []
-                for seg in full_list:
-                    seats = {}
-                    seat_num = seg.get("swz_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["商务座"] = seat_num
-                    seat_num = seg.get("tz_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["特等座"] = seat_num
-                    seat_num = seg.get("zy_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["一等座"] = seat_num
-                    seat_num = seg.get("ze_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["二等座"] = seat_num
-                    seat_num = seg.get("gr_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["高级软卧"] = seat_num
-                    seat_num = seg.get("rw_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["软卧"] = seat_num
-                    seat_num = seg.get("rz_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["一等卧"] = seat_num
-                    seat_num = seg.get("yw_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["硬卧"] = seat_num
-                    seat_num = seg.get("yz_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["硬座"] = seat_num
-                    seat_num = seg.get("wz_num", "")
-                    if seat_num and seat_num != "--" and seat_num != "":
-                        seats["无座"] = seat_num
-
-                    segment_data = {
+                segments = [
+                    {
                         "train_code": seg.get("station_train_code", ""),
                         "from_station": seg.get("from_station_name", ""),
                         "to_station": seg.get("to_station_name", ""),
                         "start_time": seg.get("start_time", ""),
                         "arrive_time": seg.get("arrive_time", ""),
                         "duration": seg.get("lishi", ""),
-                        "seats": seats
+                        "seats": _extract_seats(seg, _TRANSFER_SEAT_MAP, exclude="--"),
                     }
-                    segments.append(segment_data)
+                    for seg in full_list
+                ]
 
-                transfer_data = {
+                transfers_list.append({
                     "middle_station": item.get("middle_station_name") or (full_list[0].get("to_station_name", "") if full_list else ""),
                     "wait_time": item.get("wait_time", ""),
                     "total_duration": item.get("all_lishi", ""),
-                    "segments": segments
-                }
-                transfers_list.append(transfer_data)
-
+                    "segments": segments,
+                })
             except Exception as e:
                 logger.warning(f"解析中转方案失败: {e}")
                 continue
 
-        response_data = {
-            "success": True,
-            "from_station": from_station,
-            "to_station": to_station,
-            "train_date": train_date,
-            "count": len(transfers_list),
-            "transfers": transfers_list
-        }
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
+        return _ok(
+            from_station=from_station,
+            to_station=to_station,
+            train_date=train_date,
+            count=len(transfers_list),
+            transfers=transfers_list,
+        )
     except Exception as e:
-        logger.error(f"查询中转失败: {repr(e)}")
-        response_data = {"success": False, "error": "查询中转失败", "detail": str(e)}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _unexpected_error("查询中转", e)
 
 
 # ========== 票价查询工具 ==========
 
 async def query_ticket_price_validated(args: dict) -> list:
+    """查询火车票价信息（支持车次号过滤）。"""
     try:
         from_station = args.get("from_station", "").strip()
         to_station = args.get("to_station", "").strip()
@@ -950,168 +928,104 @@ async def query_ticket_price_validated(args: dict) -> list:
         train_code = args.get("train_code", "").strip().upper()
 
         if not from_station or not to_station or not train_date:
-            response_data = {"success": False, "error": "请输入出发站、到达站和出发日期"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err("请输入出发站、到达站和出发日期")
 
         is_valid, error_msg = validate_date_not_past(train_date)
         if not is_valid:
-            response_data = {"success": False, "error": error_msg}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(error_msg)
 
         from_code = await ensure_telecode(from_station)
-        to_code = await ensure_telecode(to_station)
-
         if not from_code:
-            response_data = {"success": False, "error": f"出发站无效: {from_station}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+            return _err(f"出发站无效: {from_station}")
+        to_code = await ensure_telecode(to_station)
         if not to_code:
-            response_data = {"success": False, "error": f"到达站无效: {to_station}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
-        url_init = HTTP_URLS["init"]
-        url_price = HTTP_URLS["query_price"]
-        headers = HTTP_HEADERS.copy()
+            return _err(f"到达站无效: {to_station}")
 
         params = {
             "leftTicketDTO.train_date": train_date,
             "leftTicketDTO.from_station": from_code,
             "leftTicketDTO.to_station": to_code,
-            "purpose_codes": purpose_codes
+            "purpose_codes": purpose_codes,
         }
 
-        max_retries = 3
-        last_exception = None
-        json_data = None
-
-        for attempt in range(max_retries):
+        async def _fetch_prices(client: httpx.AsyncClient) -> Any:
+            resp = await client.get(HTTP_URLS["query_price"], headers=HTTP_HEADERS.copy(), params=params)
+            logger.info(f"12306 price query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
+            if is_12306_error_response(resp):
+                logger.error(f"12306接口返回异常: {resp.status_code}, final_url: {resp.url}")
+                raise ApiError(
+                    "12306接口返回异常或反爬虫拦截",
+                    status_code=resp.status_code,
+                    final_url=str(resp.url),
+                    detail=resp.text[:200],
+                )
             try:
-                async with create_12306_client() as client:
-                    await client.get(url_init, headers=headers)
-                    resp = await client.get(url_price, headers=headers, params=params)
-                    logger.info(f"12306 price query status: {resp.status_code}, redirect: {get_redirect_info(resp)}")
+                return resp.json()
+            except ValueError as e:
+                logger.error(f"12306响应解析失败: {e}")
+                raise ApiError("12306响应解析失败", detail=str(e)) from e
 
-                    if is_12306_error_response(resp):
-                        logger.error(f"12306接口返回异常: {resp.status_code}, final_url: {resp.url}")
-                        response_data = {
-                            "success": False,
-                            "error": "12306接口返回异常或反爬虫拦截",
-                            "status_code": resp.status_code,
-                            "final_url": str(resp.url),
-                            "detail": resp.text[:200]
-                        }
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        try:
+            json_data = await _request_with_retry("票价查询", _fetch_prices)
+        except RetryExhaustedError as e:
+            return _err(str(e))
+        except ApiError as e:
+            return _err(e.message, **e.extra)
 
-                    try:
-                        json_data = resp.json()
-                        break
-                    except Exception as e:
-                        logger.error(f"12306响应解析失败: {str(e)}")
-                        response_data = {"success": False, "error": "12306响应解析失败", "detail": str(e)}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(f"票价查询网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"票价查询网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        if not json_data or "data" not in json_data:
+            return [{"type": "text", "text": json.dumps(json_data, ensure_ascii=False)}]
 
-        if json_data and "data" in json_data:
-            result_data = []
-            price_map = {
-                "wz_price": "无座",
-                "yz_price": "硬座",
-                "yw_price": "硬卧",
-                "rw_price": "软卧",
-                "gr_price": "高级软卧",
-                "ze_price": "二等座",
-                "zy_price": "一等座",
-                "swz_price": "商务座",
-                "tdz_price": "特等座",
-                "dw_price": "动卧"
-            }
+        result_data = []
+        for item in json_data.get("data", []):
+            dto = item.get("queryLeftNewDTO", {})
+            current_train_code = dto.get("station_train_code", "")
+            if train_code and current_train_code != train_code:
+                continue
+            result_data.append({
+                "train_no": dto.get("train_no"),
+                "train_code": current_train_code,
+                "from_station": dto.get("from_station_name"),
+                "to_station": dto.get("to_station_name"),
+                "start_time": dto.get("start_time"),
+                "arrive_time": dto.get("arrive_time"),
+                "duration": dto.get("lishi"),
+                "train_class_name": dto.get("train_class_name"),
+                "prices": {
+                    name: _format_price(dto[key])
+                    for key, name in _PRICE_FIELD_MAP.items()
+                    if (val := dto.get(key)) and val != "--"
+                },
+            })
 
-            for item in json_data.get("data", []):
-                query_left_new_dto = item.get("queryLeftNewDTO", {})
-
-                current_train_code = query_left_new_dto.get("station_train_code", "")
-                if train_code and current_train_code != train_code:
-                    continue
-
-                train_info = {
-                    "train_no": query_left_new_dto.get("train_no"),
-                    "train_code": current_train_code,
-                    "from_station": query_left_new_dto.get("from_station_name"),
-                    "to_station": query_left_new_dto.get("to_station_name"),
-                    "start_time": query_left_new_dto.get("start_time"),
-                    "arrive_time": query_left_new_dto.get("arrive_time"),
-                    "duration": query_left_new_dto.get("lishi"),
-                    "train_class_name": query_left_new_dto.get("train_class_name"),
-                    "prices": {}
-                }
-
-                for key, name in price_map.items():
-                    price_val = query_left_new_dto.get(key)
-                    if price_val and price_val != "--":
-                        try:
-                            if price_val.isdigit():
-                                price_int = int(price_val)
-                                price_str = str(price_int)
-                                if len(price_str) == 1:
-                                    formatted_price = "0." + price_str
-                                else:
-                                    formatted_price = price_str[:-1] + "." + price_str[-1]
-                                train_info["prices"][name] = formatted_price
-                            else:
-                                train_info["prices"][name] = price_val
-                        except Exception:
-                            train_info["prices"][name] = price_val
-
-                result_data.append(train_info)
-
-            final_response = {
-                "success": True,
-                "from_station": from_station,
-                "to_station": to_station,
-                "train_date": train_date,
-                "count": len(result_data),
-                "data": result_data
-            }
-            return [{"type": "text", "text": json.dumps(final_response, ensure_ascii=False)}]
-
-        return [{"type": "text", "text": json.dumps(json_data, ensure_ascii=False)}]
-
+        return _ok(
+            from_station=from_station,
+            to_station=to_station,
+            train_date=train_date,
+            count=len(result_data),
+            data=result_data,
+        )
     except Exception as e:
-        logger.error(f"查询票价失败: {repr(e)}")
-        response_data = {"success": False, "error": "查询票价失败", "detail": str(e)}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _unexpected_error("查询票价", e)
 
 
 # ========== 当前时间工具 ==========
 
 async def get_current_time_validated(args: dict) -> list:
+    """获取当前日期和时间信息，支持相对日期计算。"""
     try:
         timezone_str = args.get("timezone", "Asia/Shanghai")
         try:
             tz = pytz.timezone(timezone_str)
-            now = datetime.now(tz)
         except pytz.exceptions.UnknownTimeZoneError:
             tz = pytz.timezone("Asia/Shanghai")
-            now = datetime.now(tz)
+        now = datetime.now(tz)
 
-        response_data = {
-            "success": True,
-            "timezone": tz.zone,
-            "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "date": now.strftime("%Y-%m-%d"),
-            "time": now.strftime("%H:%M:%S"),
-            "timestamp": int(now.timestamp())
-        }
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _ok(
+            timezone=tz.zone,
+            datetime=now.strftime("%Y-%m-%d %H:%M:%S"),
+            date=now.strftime("%Y-%m-%d"),
+            time=now.strftime("%H:%M:%S"),
+            timestamp=int(now.timestamp()),
+        )
     except Exception as e:
-        logger.error(f"获取时间信息失败: {repr(e)}")
-        response_data = {"success": False, "error": "获取时间信息失败", "detail": str(e)}
-        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        return _unexpected_error("获取时间信息", e)

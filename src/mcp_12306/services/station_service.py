@@ -5,26 +5,26 @@ import logging
 from typing import Optional
 
 class Station:
-    def __init__(self, name, code, pinyin, py_short, num, city=None):
-        self.name = name
-        self.code = code
-        self.pinyin = pinyin
-        self.py_short = py_short
-        self.num = num
-        self.city = city  # 城市字段可选
+    def __init__(self, name: str, code: str, pinyin: str, py_short: str, num: str, city: str | None = None):
+        self.name: str = name
+        self.code: str = code
+        self.pinyin: str = pinyin
+        self.py_short: str = py_short
+        self.num: str = num
+        self.city: str | None = city  # 城市字段可选
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Station(name={self.name}, code={self.code}, pinyin={self.pinyin}, city={self.city})"
 
 class StationSearchResult:
-    def __init__(self, stations):
-        self.stations = stations
+    def __init__(self, stations: list[Station]):
+        self.stations: list[Station] = stations
 
 class StationService:
-    def __init__(self):
-        self.stations = []
+    def __init__(self) -> None:
+        self.stations: list[Station] = []
 
-    async def load_stations(self, path=None):
+    async def load_stations(self, path: str | None = None) -> None:
         """
         解析12306原始JS，提取站点及所属城市信息
         自动检测并修复字段顺序异常的数据行，增强排列组合尝试。
@@ -71,11 +71,11 @@ class StationService:
             num = parts[5].strip()
             city = parts[7].strip()
             # 检查三字码、拼音、简拼是否合规，否则尝试排列组合
-            def is_code(val):
+            def is_code(val: str) -> bool:
                 return val.isalpha() and val.isupper() and len(val) == 3
-            def is_pinyin(val):
+            def is_pinyin(val: str) -> bool:
                 return val.isalpha() and val.islower() and len(val) >= 2
-            def is_py_short(val):
+            def is_py_short(val: str) -> bool:
                 return val.isalpha() and val.islower() and 1 <= len(val) <= 8
             if not is_code(code):
                 found = False
@@ -111,7 +111,7 @@ class StationService:
         self.stations = result
         logging.info(f"已加载{len(self.stations)}个车站（含城市信息，自动排列修正字段）")
 
-    async def get_station_by_name(self, name):
+    async def get_station_by_name(self, name: str) -> Station | None:
         name = name.strip()
         if name.endswith("站") and len(name) > 2:
             name = name[:-1]
@@ -120,13 +120,13 @@ class StationService:
                 return s
         return None
 
-    async def get_station_by_code(self, code):
+    async def get_station_by_code(self, code: str) -> Station | None:
         for s in self.stations:
             if s.code == code:
                 return s
         return None
 
-    async def search_stations(self, query, limit=10):
+    async def search_stations(self, query: str, limit: int = 10) -> StationSearchResult:
         query = query.strip().lower()
         if query.endswith("站") and len(query) > 2:
             query = query[:-1]
